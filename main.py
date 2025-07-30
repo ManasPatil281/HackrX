@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException,Depends,Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Union
 import time
@@ -8,6 +9,7 @@ import requests
 import tempfile
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+
 
 # Load environment variables from .env file
 load_dotenv()
@@ -43,8 +45,12 @@ class QueryRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-# Initialize FastAPI application
-app = FastAPI(title="RAG Backend API", version="1.0.0")
+# Initialize FastAPI application with security documentation
+app = FastAPI(
+    title="RAG Backend API", 
+    version="1.0.0",
+    description="RAG Backend with Bearer Token Authentication"
+)
 
 # Configure CORS middleware
 app.add_middleware(
@@ -54,6 +60,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+# Define security scheme for documentation  
+security = HTTPBearer()
 
 # Configuration
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -298,9 +307,66 @@ async def vector_stats():
         
     except Exception as e:
         return {"error": str(e), "status": "error"}
+    
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    import sys
+    print("\n" + "="*50, file=sys.stderr, flush=True)
+    print("🔍 TOKEN VERIFICATION CALLED", file=sys.stderr, flush=True)
+    print("="*50, file=sys.stderr, flush=True)
+    
+    received_token = credentials.credentials
+    expected_token = os.getenv("AUTH_TOKEN")
+    
+    print(f"🔍 RECEIVED TOKEN: '{received_token}'", file=sys.stderr, flush=True)
+    print(f"🔍 EXPECTED TOKEN: '{expected_token}'", file=sys.stderr, flush=True)
+    print(f"🔍 LENGTHS - Received: {len(received_token)}, Expected: {len(expected_token) if expected_token else 0}", file=sys.stderr, flush=True)
+    
+    if not expected_token:
+        print("❌ AUTH_TOKEN not set in environment", file=sys.stderr, flush=True)
+        raise HTTPException(
+            status_code=500, 
+            detail="Server configuration error: AUTH_TOKEN not set."
+        )
+
+    # Try exact match first
+    if received_token == expected_token:
+        print("✅ EXACT TOKEN MATCH", file=sys.stderr, flush=True)
+        return received_token
+    
+    # Try stripped match
+    if received_token.strip() == expected_token.strip():
+        print("✅ TOKEN MATCH AFTER STRIP", file=sys.stderr, flush=True)
+        return received_token
+    
+    # If no match, show detailed comparison
+    print("❌ TOKEN MISMATCH DETAILS:", file=sys.stderr, flush=True)
+    print(f"  Received bytes: {received_token.encode()}", file=sys.stderr, flush=True)
+    print(f"  Expected bytes: {expected_token.encode()}", file=sys.stderr, flush=True)
+    
+    raise HTTPException(
+        status_code=403, 
+        detail="Invalid or expired token."
+    )
+
+@app.get("/debug-token")
+async def debug_token():
+    """Debug endpoint to check token configuration."""
+    expected_token = os.getenv("AUTH_TOKEN")
+    return {
+        "auth_token_set": expected_token is not None,
+        "auth_token_length": len(expected_token) if expected_token else 0,
+        "auth_token_first_10": expected_token[:10] if expected_token else None,
+        "auth_token_last_10": expected_token[-10:] if expected_token else None,
+        "full_token": expected_token  # Temporary for debugging
+    }
+
+@app.get("/test-auth")
+async def test_auth(token: str = Depends(verify_token)):
+    """Test endpoint to verify authentication is working."""
+    return {"message": "Authentication successful!", "token_received": token[:10] + "..."}
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
-async def run_query(request: QueryRequest):
+async def run_query(request: QueryRequest, token: str = Depends(verify_token)):
     global vector_store
     
     # Check if required components are available
