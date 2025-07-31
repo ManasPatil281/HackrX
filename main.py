@@ -22,6 +22,9 @@ load_dotenv()
 # Only suppress tokenizer parallelism warnings (still useful for HuggingFace)
 os.environ['TOKENIZERS_PARALLELISM'] = os.getenv('TOKENIZERS_PARALLELISM', 'false')
 
+# API Keys
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+
 try:
     from langchain_community.vectorstores import FAISS
     from langchain_huggingface import HuggingFaceEmbeddings
@@ -34,6 +37,7 @@ try:
     from langchain.prompts import PromptTemplate
     from langchain.retrievers import EnsembleRetriever
     from langchain_community.retrievers import BM25Retriever
+
     print("✅ All imports successful")
 except ImportError as e:
     print(f"❌ Import error: {e}")
@@ -49,6 +53,10 @@ class ClaimRequest(BaseModel):
     documents: Union[List[str], str]
     claim_details: Dict[str, Any] = Field(default_factory=dict)
     questions: List[str]
+
+# Simple response model to match required format
+class AnswerResponse(BaseModel):
+    answers: List[str]
 
 class CoordinationOfBenefits(BaseModel):
     has_other_insurance: bool = False
@@ -152,6 +160,31 @@ Insurance Analysis (JSON format only):
 # Create the enhanced prompt template
 ENHANCED_PROMPT = PromptTemplate(
     template=INSURANCE_CLAIM_PROMPT,
+    input_variables=["context", "question"]
+)
+
+# Enhanced Insurance-Specific Prompt Template for natural answers
+INSURANCE_ANSWER_PROMPT = """
+You are an expert insurance policy advisor. Based on the provided policy context, answer the question with precise information including specific policy section references.
+
+POLICY CONTEXT:
+{context}
+
+QUESTION: {question}
+
+INSTRUCTIONS:
+- Provide a comprehensive answer based on the policy information
+- Include specific policy section numbers when referencing rules
+- Quote exact amounts, percentages, and conditions
+- If multiple policies are involved, explain the coordination process
+- Be specific about rights, limitations, and procedures
+- Start your answer with reference to the relevant policy section when applicable
+
+ANSWER:"""
+
+# Create the enhanced prompt template
+ANSWER_PROMPT = PromptTemplate(
+    template=INSURANCE_ANSWER_PROMPT,
     input_variables=["context", "question"]
 )
 
@@ -265,16 +298,30 @@ except Exception as e:
         )
         print("✅ Fallback local embeddings initialized successfully")
     except Exception as e2:
-        print(f"❌ All embedding methods failed: {e2}")
+        print(f"❌ Error initializing fallback embeddings: {e2}")
         embeddings = None
 
 try:
-    llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
-        groq_api_key=GROQ_API_KEY,
-        temperature=0
-    )
-    print("✅ LLM initialized successfully")
+    from langchain_mistralai import ChatMistralAI
+    # Configuration for the LLM
+    CONFIG = {
+        'temperature': 0.2,
+        'max_tokens': 2000
+    }
+    
+    if MISTRAL_API_KEY:
+        llm = ChatMistralAI(
+            model="mistral-small-latest",
+            mistral_api_key=MISTRAL_API_KEY,
+            temperature=CONFIG['temperature'],
+            max_tokens=CONFIG['max_tokens']
+        )
+        print("✅ LLM initialized successfully")
+    else:
+        print("⚠️ MISTRAL_API_KEY not found in environment variables")
+        llm = None
+    
+    
 except Exception as e:
     print(f"❌ Error initializing LLM: {e}")
     llm = None
@@ -296,11 +343,54 @@ text_splitter = RecursiveCharacterTextSplitter(
     keep_separator=True
 )
 
+class BatchProcessor:
+    """Handles batch processing of questions for efficiency"""
+    
+    def __init__(self, llm, prompt_template, max_batch_size=5):
+        self.llm = llm
+        self.prompt_template = prompt_template
+        self.max_batch_size = max_batch_size
+        self.executor = ThreadPoolExecutor(max_workers=5)
+    
+    def clean_response(self, response_text):
+        """Clean up LLM response text"""
+        # Remove common prefixes that LLMs sometimes add
+        cleaned = re.sub(r'^(Answer:|ANSWER:|Response:|Here\'s the answer:)\s*', '', response_text.strip())
+        return cleaned.strip()
+    
+    async def process_question(self, question, context):
+        """Process a single question with the given context"""
+        try:
+            formatted_prompt = self.prompt_template.format(context=context, question=question)
+            llm_result = await asyncio.to_thread(self.llm.invoke, formatted_prompt)
+            response_text = llm_result.content if hasattr(llm_result, 'content') else str(llm_result)
+            return self.clean_response(response_text)
+        except Exception as e:
+            print(f"Error processing question: {str(e)}")
+            return f"Error answering question: {str(e)}"
+    
+    async def process_questions_batch(self, questions, context):
+        """Process multiple questions in batches for efficiency"""
+        results = []
+        
+        # Process in batches of max_batch_size
+        for i in range(0, len(questions), self.max_batch_size):
+            batch = questions[i:i+self.max_batch_size]
+            print(f"Processing batch of {len(batch)} questions")
+            
+            # Create tasks for concurrent processing
+            tasks = [self.process_question(q, context) for q in batch]
+            batch_results = await asyncio.gather(*tasks)
+            results.extend(batch_results)
+        
+        return results
+
 # Initialize decision engine and global variables
 decision_engine = InsuranceDecisionEngine()
 vector_store = None
 hybrid_retriever = None
 processed_documents = []
+batch_processor = None
 
 # Helper functions (keeping existing ones and adding new)
 def is_url(string: str) -> bool:
@@ -510,8 +600,128 @@ async def debug_search(request: DebugRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Debug search error: {str(e)}")
 
-@app.post("/hackrx/run", response_model=EnhancedAnswerResponse)
+@app.post("/hackrx/run", response_model=AnswerResponse)
 async def run_enhanced_query(request: ClaimRequest, token: str = Depends(verify_token)):
+    global vector_store, hybrid_retriever, processed_documents, batch_processor
+    
+    if embeddings is None or llm is None:
+        raise HTTPException(status_code=500, detail="Core components not initialized")
+    
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    print(f"🎯 Processing {len(request.questions)} questions with batch processing - Request: {request_id}")
+    
+    try:
+        # Step 1: Process documents
+        document_content = process_documents(request.documents)
+        
+        if document_content.strip():
+            docs = [Document(page_content=document_content)]
+            chunks = text_splitter.split_documents(docs)
+            print(f"📊 Created {len(chunks)} chunks from documents")
+            
+            # Create or update vector store
+            if vector_store is None:
+                print("🚀 Creating new vector store...")
+                vector_store = FAISS.from_documents(chunks, embeddings)
+                processed_documents = chunks
+                print("✅ Vector store created successfully")
+            else:
+                print("🔄 Adding documents to existing vector store...")
+                vector_store.add_documents(chunks)
+                processed_documents.extend(chunks)
+                print("✅ Documents added to existing vector store")
+            
+            # Initialize hybrid retriever
+            hybrid_retriever = HybridRetriever(vector_store, processed_documents)
+            print("✅ Hybrid retriever initialized")
+        
+        # Initialize batch processor if not already done
+        if batch_processor is None:
+            batch_processor = BatchProcessor(llm, ANSWER_PROMPT, max_batch_size=5)
+            print("✅ Batch processor initialized")
+        
+        # Step 2: Enhanced batch processing for questions
+        answers = []
+        
+        if vector_store is None:
+            # No documents available
+            answers = ["No policy documents available for analysis."] * len(request.questions)
+        else:
+            if len(request.questions) > 1:
+                print(f"🚀 Using batch processing for {len(request.questions)} questions")
+                
+                # Get unified context for all questions (optimize retrieval)
+                all_questions_text = " ".join(request.questions)
+                
+                if hybrid_retriever:
+                    relevant_docs = hybrid_retriever.retrieve_relevant_docs(all_questions_text, k=10)
+                else:
+                    retriever = vector_store.as_retriever(
+                        search_type="similarity",
+                        search_kwargs={"k": 10, "fetch_k": 20}
+                    )
+                    relevant_docs = retriever.get_relevant_documents(all_questions_text)
+                
+                if relevant_docs:
+                    # Create comprehensive context for all questions
+                    context = "\n\n".join([doc.page_content for doc in relevant_docs])
+                    
+                    # Limit context length for performance
+                    if len(context) > 8000:
+                        context = context[:8000] + "\n\n[Additional policy sections available]"
+                    
+                    # Process all questions in batches
+                    batch_start_time = time.time()
+                    answers = await batch_processor.process_questions_batch(request.questions, context)
+                    batch_time = time.time() - batch_start_time
+                    print(f"⚡ Batch processing completed in {batch_time:.2f} seconds")
+                    
+                else:
+                    answers = ["No relevant policy information found for the questions."] * len(request.questions)
+            
+            else:
+                # Single question processing
+                question = request.questions[0]
+                print(f"🔄 Processing single question: {question}")
+                
+                if hybrid_retriever:
+                    relevant_docs = hybrid_retriever.retrieve_relevant_docs(question, k=8)
+                else:
+                    retriever = vector_store.as_retriever(
+                        search_type="similarity",
+                        search_kwargs={"k": 8, "fetch_k": 16}
+                    )
+                    relevant_docs = retriever.get_relevant_documents(question)
+                
+                if relevant_docs:
+                    context = "\n\n".join([doc.page_content for doc in relevant_docs])
+                    
+                    formatted_prompt = ANSWER_PROMPT.format(context=context, question=question)
+                    llm_result = await asyncio.to_thread(llm.invoke, formatted_prompt)
+                    response_text = llm_result.content if hasattr(llm_result, 'content') else str(llm_result)
+                    
+                    # Clean the response
+                    cleaned_answer = batch_processor.clean_response(response_text) if batch_processor else response_text
+                    answers = [cleaned_answer]
+                else:
+                    answers = ["No relevant policy information found for this question."]
+        
+        processing_time = time.time() - start_time
+        print(f"🎉 Processing completed in {processing_time:.2f} seconds ({processing_time/len(request.questions):.2f}s per question)")
+        
+        return AnswerResponse(answers=answers)
+        
+    except Exception as e:
+        print(f"❌ Error in batch processing: {str(e)}")
+        error_answers = [f"Error processing question: {str(e)}"] * len(request.questions)
+        return AnswerResponse(answers=error_answers)
+
+# Enhanced endpoint for structured responses (keeping original functionality)
+@app.post("/hackrx/structured", response_model=EnhancedAnswerResponse)
+async def run_structured_query(request: ClaimRequest, token: str = Depends(verify_token)):
+    """Enhanced endpoint that returns structured decisions with full metadata"""
     global vector_store, hybrid_retriever, processed_documents
     
     if embeddings is None or llm is None:
@@ -655,16 +865,16 @@ async def run_enhanced_query(request: ClaimRequest, token: str = Depends(verify_
 
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Starting Enhanced HackRx 6.0 RAG Backend Server...")
+    print("🚀 Starting Enhanced HackRx 6.0 RAG Backend Server with Batch Processing...")
     print("📍 Server will be available at:")
     print("   - http://localhost:5000")
     print("   - http://127.0.0.1:5000") 
     print("🎯 HackRx 6.0 Features:")
-    print("   - Insurance claim decision engine")
-    print("   - Coordination of benefits analysis")
-    print("   - Structured JSON responses with confidence scores")
+    print("   - LangChain batch processing for multiple questions")
+    print("   - Simple answers format: {\"answers\": [\"...\"]}")
+    print("   - Insurance policy analysis with section references")
     print("   - Hybrid retrieval (Vector + BM25)")
-    print("   - Audit trail and processing metadata")
-    print("   - Policy section referencing")
+    print("   - Structured responses available at /hackrx/structured")
+    print("   - Enhanced performance for multiple questions")
     
     uvicorn.run(app, host=HOST, port=PORT)
