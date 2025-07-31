@@ -10,3 +10,4 @@ python-dotenv
 pypdf
 faiss-cpu
 typing-extensions
+langchain-mistralai
