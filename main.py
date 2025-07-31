@@ -1,15 +1,20 @@
-from fastapi import FastAPI, HTTPException,Depends,Header
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from typing import List, Union
+from pydantic import BaseModel, Field
+from typing import List, Union, Optional, Dict, Any
 import time
 import os
 import requests
 import tempfile
+import json
+import re
 from urllib.parse import urlparse
 from dotenv import load_dotenv
-
+from datetime import datetime
+import uuid
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,29 +32,59 @@ try:
     from langchain_community.document_loaders import PyPDFLoader
     from langchain_huggingface import HuggingFaceEndpointEmbeddings
     from langchain.prompts import PromptTemplate
+    from langchain.retrievers import EnsembleRetriever
+    from langchain_community.retrievers import BM25Retriever
     print("✅ All imports successful")
 except ImportError as e:
     print(f"❌ Import error: {e}")
     print("Please install missing dependencies:")
-    print("pip install langchain langchain-community langchain-groq langchain-huggingface faiss-cpu pypdf requests")
+    print("pip install langchain langchain-community langchain-groq langchain-huggingface faiss-cpu pypdf requests rank-bm25")
     exit(1)
 
-# Define request and response models
+# Enhanced request and response models for insurance claim processing
 class DebugRequest(BaseModel):
     question: str
 
-class QueryRequest(BaseModel):
-    documents: Union[List[str], str]  # Allow both list of strings and single string
+class ClaimRequest(BaseModel):
+    documents: Union[List[str], str]
+    claim_details: Dict[str, Any] = Field(default_factory=dict)
     questions: List[str]
 
-class AnswerResponse(BaseModel):
-    answers: List[str]
+class CoordinationOfBenefits(BaseModel):
+    has_other_insurance: bool = False
+    primary_insurance: Optional[str] = None
+    secondary_insurance: Optional[str] = None
+    primary_payment: Optional[float] = None
+    remaining_amount: Optional[float] = None
 
-# Initialize FastAPI application with security documentation
+class ClaimDecision(BaseModel):
+    question: str
+    decision: str  # "APPROVED", "DENIED", "PENDING_REVIEW"
+    confidence_score: float = Field(ge=0.0, le=1.0)
+    payout_amount: Optional[float] = None
+    reasoning: str
+    policy_sections_referenced: List[str] = Field(default_factory=list)
+    exclusions_applied: List[str] = Field(default_factory=list)
+    coordination_of_benefits: Optional[CoordinationOfBenefits] = None
+    processing_notes: List[str] = Field(default_factory=list)
+
+class ProcessingMetadata(BaseModel):
+    request_id: str
+    processing_time: float
+    chunks_analyzed: int
+    model_used: str
+    timestamp: str
+
+class EnhancedAnswerResponse(BaseModel):
+    decisions: List[ClaimDecision]
+    processing_metadata: ProcessingMetadata
+    audit_trail: List[str] = Field(default_factory=list)
+
+# Initialize FastAPI application with enhanced documentation
 app = FastAPI(
-    title="RAG Backend API", 
-    version="1.0.0",
-    description="RAG Backend with Bearer Token Authentication"
+    title="HackRx 6.0 Insurance RAG Backend", 
+    version="2.0.0",
+    description="Advanced RAG Backend with Insurance Claim Decision Engine and Structured Analysis"
 )
 
 # Configure CORS middleware
@@ -61,7 +96,6 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# Define security scheme for documentation  
 security = HTTPBearer()
 
 # Configuration
@@ -70,39 +104,154 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 5000))
 
-# Custom prompt template for RAG
-CUSTOM_PROMPT_TEMPLATE = """
-You are a highly accurate assistant designed to answer customer questions based **only** on the provided policy context.
+# Enhanced Insurance-Specific Prompt Template
+INSURANCE_CLAIM_PROMPT = """
+You are an expert insurance claim processor with deep knowledge of policy terms, coverage rules, and claim evaluation. You must analyze claims systematically and provide structured decisions.
 
-YOUR TASK:
-- Search the entire context carefully and repeatedly to find the exact, complete answer.
-- Pay special attention to terms like "coordination of benefits", "multiple insurance", "other insurance", "secondary claims", "remaining amount", "balance claim", or similar concepts.
-- Only return facts found **explicitly** in the context; do not guess, assume, or infer.
-- Use clear, friendly, and simple language.
-- Answer in **1 to 3 sentences maximum**.
-- **Do not** include line breaks, bullet points, formatting symbols, or additional commentary.
-- Include specific conditions or sections in the policy in detail for the answer.
-- If the answer is not found in the context, say: "This information is not available in the provided policy context."
-- Your goal is to extract accurate, complete answers in natural, helpful language.
-- Support your answer with the facts and evidence, mention it in the answer.
+ANALYSIS FRAMEWORK:
+1. **Eligibility Assessment**: Determine if the claim is covered under the policy
+2. **Coverage Limits**: Identify applicable limits, deductibles, and caps
+3. **Coordination of Benefits**: Check for multiple insurance policies and calculate remaining amounts
+4. **Exclusion Review**: Identify any policy exclusions that apply
+5. **Decision Logic**: Apply business rules to determine approval/denial
+6. **Payout Calculation**: Calculate exact amounts considering all factors
 
-Context:
----------
+RESPONSE FORMAT (Must be valid JSON):
+{{
+    "decision": "[APPROVED/DENIED/PENDING_REVIEW]",
+    "confidence_score": [0.0-1.0],
+    "payout_amount": [amount or null],
+    "reasoning": "Detailed explanation with specific policy references",
+    "policy_sections_referenced": ["section1", "section2"],
+    "exclusions_applied": ["exclusion1", "exclusion2"],
+    "coordination_of_benefits": {{
+        "has_other_insurance": [true/false],
+        "primary_insurance": "name or null",
+        "secondary_insurance": "name or null", 
+        "primary_payment": [amount or null],
+        "remaining_amount": [amount or null]
+    }},
+    "processing_notes": ["note1", "note2"]
+}}
+
+IMPORTANT RULES:
+- Base decisions ONLY on information in the policy context
+- For coordination of benefits, calculate remaining amounts after primary insurance
+- Include confidence scores based on clarity of policy language
+- Reference specific policy sections in your reasoning
+- If information is unclear, use "PENDING_REVIEW" decision
+
+Policy Context:
 {context}
 
-Q: {question}
-A:
+Claim Question: {question}
+
+Insurance Analysis (JSON format only):
 """
 
-# Create the prompt template
-PROMPT = PromptTemplate(
-    template=CUSTOM_PROMPT_TEMPLATE,
+# Create the enhanced prompt template
+ENHANCED_PROMPT = PromptTemplate(
+    template=INSURANCE_CLAIM_PROMPT,
     input_variables=["context", "question"]
 )
 
-# Initialize components with error handling
+class InsuranceDecisionEngine:
+    """Core decision engine for insurance claim processing"""
+    
+    def __init__(self):
+        self.decision_rules = {
+            'min_confidence_for_approval': 0.7,
+            'max_payout_without_review': 10000,
+            'coordination_keywords': [
+                'coordination of benefits', 'other insurance', 'secondary claim',
+                'primary insurance', 'remaining amount', 'balance claim'
+            ],
+            'exclusion_keywords': [
+                'excluded', 'not covered', 'limitation', 'restriction'
+            ]
+        }
+    
+    def extract_financial_amounts(self, text: str) -> List[float]:
+        """Extract dollar amounts from text"""
+        amounts = re.findall(r'\$?[\d,]+\.?\d*', text)
+        return [float(amt.replace('$', '').replace(',', '')) for amt in amounts if amt]
+    
+    def detect_coordination_of_benefits(self, context: str, question: str) -> bool:
+        """Detect if coordination of benefits applies"""
+        combined_text = (context + " " + question).lower()
+        return any(keyword in combined_text for keyword in self.decision_rules['coordination_keywords'])
+    
+    def calculate_confidence_score(self, context: str, decision_factors: Dict) -> float:
+        """Calculate confidence score based on various factors"""
+        score = 0.5  # Base score
+        
+        # Boost confidence if specific policy sections are mentioned
+        if decision_factors.get('policy_sections_referenced'):
+            score += 0.2
+        
+        # Reduce confidence if coordination of benefits is involved
+        if decision_factors.get('has_coordination'):
+            score -= 0.1
+        
+        # Boost confidence if clear dollar amounts are present
+        if decision_factors.get('has_amounts'):
+            score += 0.1
+        
+        # Ensure score is within bounds
+        return max(0.0, min(1.0, score))
+
+class HybridRetriever:
+    """Enhanced retrieval system combining semantic and keyword search"""
+    
+    def __init__(self, vector_store, documents):
+        self.vector_store = vector_store
+        self.documents = documents
+        self.setup_hybrid_retrieval()
+    
+    def setup_hybrid_retrieval(self):
+        """Setup hybrid retrieval combining vector and BM25 search"""
+        try:
+            # Create BM25 retriever for keyword matching
+            doc_texts = [doc.page_content for doc in self.documents]
+            self.bm25_retriever = BM25Retriever.from_texts(doc_texts)
+            self.bm25_retriever.k = 6
+            print("✅ BM25 retriever initialized")
+        except Exception as e:
+            print(f"⚠️ BM25 retriever failed, using vector-only: {e}")
+            self.bm25_retriever = None
+    
+    def retrieve_relevant_docs(self, query: str, k: int = 6) -> List[Document]:
+        """Retrieve documents using hybrid approach"""
+        all_docs = []
+        
+        # Vector-based retrieval
+        vector_retriever = self.vector_store.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": k, "fetch_k": k * 2}
+        )
+        vector_docs = vector_retriever.get_relevant_documents(query)
+        all_docs.extend(vector_docs)
+        
+        # BM25 keyword retrieval (if available)
+        if self.bm25_retriever:
+            try:
+                bm25_docs = self.bm25_retriever.get_relevant_documents(query)
+                all_docs.extend(bm25_docs)
+            except Exception as e:
+                print(f"⚠️ BM25 retrieval failed: {e}")
+        
+        # Remove duplicates and return top k
+        unique_docs = []
+        seen_content = set()
+        for doc in all_docs:
+            if doc.page_content not in seen_content:
+                unique_docs.append(doc)
+                seen_content.add(doc.page_content)
+        
+        return unique_docs[:k]
+
+# Initialize components with enhanced error handling
 try:
-    # Use HuggingFaceEndpointEmbeddings for remote API calls (no local TensorFlow)
     embeddings = HuggingFaceEndpointEmbeddings(
         model="sentence-transformers/all-mpnet-base-v2",
         huggingfacehub_api_token=HF_TOKEN
@@ -110,7 +259,6 @@ try:
     print("✅ HuggingFace Endpoint Embeddings initialized successfully")
 except Exception as e:
     print(f"❌ Error initializing endpoint embeddings: {e}")
-    # Fallback to local model (will use TensorFlow)
     try:
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
@@ -131,13 +279,30 @@ except Exception as e:
     print(f"❌ Error initializing LLM: {e}")
     llm = None
 
+# Enhanced text splitter for insurance documents
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=800,  # Smaller chunks for better granularity
-    chunk_overlap=150,  # More overlap to preserve context
-    separators=["\n\n", "\n", ". ", " ", ""]  # Better text splitting
+    chunk_size=1000,
+    chunk_overlap=200,
+    separators=[
+        "\n\n### ",  # Policy sections
+        "\n\nSection ",  # Section breaks
+        "\n\nClause ",   # Clause breaks
+        "\n\n",          # Paragraphs
+        "\n",            # Lines
+        ". ",            # Sentences
+        " ",             # Words
+    ],
+    length_function=len,
+    keep_separator=True
 )
 
-# Helper function to check if string is a URL
+# Initialize decision engine and global variables
+decision_engine = InsuranceDecisionEngine()
+vector_store = None
+hybrid_retriever = None
+processed_documents = []
+
+# Helper functions (keeping existing ones and adding new)
 def is_url(string: str) -> bool:
     try:
         result = urlparse(string)
@@ -145,36 +310,29 @@ def is_url(string: str) -> bool:
     except:
         return False
 
-# Helper function to download and extract text from PDF
 def extract_pdf_content(pdf_url: str) -> str:
     try:
         print(f"📥 Downloading PDF from: {pdf_url}")
         
-        # Download the PDF
         response = requests.get(pdf_url, timeout=30)
         response.raise_for_status()
         
-        # Save to temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
             temp_file.write(response.content)
             temp_path = temp_file.name
         
-        # Extract text using PyPDFLoader
         loader = PyPDFLoader(temp_path)
         pages = loader.load()
         
-        # Combine all page content with better formatting
         content = ""
         for i, page in enumerate(pages):
             page_text = page.page_content.strip()
             if page_text:
                 content += f"\n--- Page {i+1} ---\n{page_text}\n"
         
-        # Clean up the content
-        content = content.replace('\n\n\n', '\n\n')  # Remove excessive newlines
-        content = content.replace('\t', ' ')  # Replace tabs with spaces
+        content = content.replace('\n\n\n', '\n\n')
+        content = content.replace('\t', ' ')
         
-        # Clean up temporary file
         os.unlink(temp_path)
         
         print(f"✅ PDF extracted successfully. Content length: {len(content)} characters")
@@ -184,7 +342,6 @@ def extract_pdf_content(pdf_url: str) -> str:
         print(f"❌ Error extracting PDF content: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to extract PDF content: {str(e)}")
 
-# Helper function to process documents (handles both text and URLs)
 def process_documents(documents: Union[List[str], str]) -> str:
     if isinstance(documents, str):
         documents = [documents]
@@ -194,32 +351,95 @@ def process_documents(documents: Union[List[str], str]) -> str:
     for doc in documents:
         if is_url(doc):
             if doc.lower().endswith('.pdf') or 'pdf' in doc.lower():
-                # Extract PDF content
                 pdf_content = extract_pdf_content(doc)
                 processed_content.append(pdf_content)
             else:
                 raise HTTPException(status_code=400, detail=f"URL format not supported: {doc}")
         else:
-            # Treat as text content
             processed_content.append(doc)
     
     return "\n".join(processed_content)
 
-# Global variable to store the vector store
-vector_store = None
+def parse_llm_response(response_text: str) -> Dict:
+    """Parse structured JSON response from LLM"""
+    try:
+        # Try to extract JSON from response
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            return json.loads(json_str)
+        else:
+            # Fallback parsing for non-JSON responses
+            return {
+                "decision": "PENDING_REVIEW",
+                "confidence_score": 0.5,
+                "payout_amount": None,
+                "reasoning": response_text,
+                "policy_sections_referenced": [],
+                "exclusions_applied": [],
+                "coordination_of_benefits": {
+                    "has_other_insurance": False,
+                    "primary_insurance": None,
+                    "secondary_insurance": None,
+                    "primary_payment": None,
+                    "remaining_amount": None
+                },
+                "processing_notes": ["Response parsing required fallback method"]
+            }
+    except json.JSONDecodeError as e:
+        print(f"⚠️ JSON parsing failed: {e}")
+        return {
+            "decision": "PENDING_REVIEW",
+            "confidence_score": 0.3,
+            "payout_amount": None,
+            "reasoning": f"Error parsing response: {response_text}",
+            "policy_sections_referenced": [],
+            "exclusions_applied": [],
+            "coordination_of_benefits": {
+                "has_other_insurance": False,
+                "primary_insurance": None,
+                "secondary_insurance": None,
+                "primary_payment": None,
+                "remaining_amount": None
+            },
+            "processing_notes": [f"JSON parsing error: {str(e)}"]
+        }
 
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    received_token = credentials.credentials
+    expected_token = os.getenv("AUTH_TOKEN")
+    
+    if not expected_token:
+        raise HTTPException(status_code=500, detail="Server configuration error: AUTH_TOKEN not set.")
+
+    if received_token == expected_token or received_token.strip() == expected_token.strip():
+        return received_token
+    
+    raise HTTPException(status_code=403, detail="Invalid or expired token.")
+
+# Enhanced API Endpoints
 @app.get("/")
 def root():
     return {
-        "message": "LangChain RAG Backend with Groq Llama + HuggingFace + FAISS",
+        "message": "HackRx 6.0 Insurance RAG Backend with Decision Engine",
+        "version": "2.0.0",
         "status": "running",
+        "features": [
+            "Insurance claim decision engine",
+            "Coordination of benefits analysis",
+            "Structured JSON responses",
+            "Hybrid retrieval (Vector + BM25)",
+            "Confidence scoring",
+            "Audit trail support"
+        ],
         "supported_formats": ["text", "pdf_urls"],
         "endpoints": {
             "health": "/health",
-            "rag_status": "/rag-status",
+            "rag_status": "/rag-status", 
             "run_query": "/hackrx/run",
             "debug_search": "/debug-search",
-            "vector_stats": "/vector-stats"
+            "vector_stats": "/vector-stats",
+            "decision_engine_status": "/decision-engine-status"
         }
     }
 
@@ -229,46 +449,40 @@ def health_check():
         "status": "healthy",
         "embeddings_ready": embeddings is not None,
         "llm_ready": llm is not None,
-        "vector_store_ready": vector_store is not None
+        "vector_store_ready": vector_store is not None,
+        "decision_engine_ready": decision_engine is not None,
+        "hybrid_retriever_ready": hybrid_retriever is not None
     }
 
-@app.get("/rag-status")
-def rag_status():
-    """Check RAG tool configuration and status."""
+@app.get("/decision-engine-status")
+def decision_engine_status():
+    """Check decision engine configuration and rules"""
     return {
-        "rag_tool_configured": True,
-        "llm_provider": "groq",
-        "llm_model": "llama-3.3-70b-versatile",
-        "llm_ready": llm is not None,
-        "embedding_provider": "huggingface_endpoint", 
-        "embedding_model": "sentence-transformers/all-mpnet-base-v2",
-        "embeddings_ready": embeddings is not None,
-        "vector_db": "faiss",
-        "vector_store_ready": vector_store is not None,
-        "chunk_size": 800,
-        "chunk_overlap": 150,
-        "framework": "langchain"
+        "engine_active": True,
+        "decision_rules": decision_engine.decision_rules,
+        "supported_decisions": ["APPROVED", "DENIED", "PENDING_REVIEW"],
+        "coordination_benefits_supported": True,
+        "confidence_scoring_enabled": True
     }
 
 @app.post("/debug-search")
 async def debug_search(request: DebugRequest):
-    """Debug endpoint to see what chunks are retrieved for a question."""
-    global vector_store
+    """Enhanced debug endpoint with hybrid retrieval information"""
+    global hybrid_retriever
     
     if vector_store is None:
         raise HTTPException(status_code=400, detail="No vector store available")
     
     try:
-        # Get retriever
-        retriever = vector_store.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 6, "fetch_k": 12}
-        )
+        if hybrid_retriever:
+            docs = hybrid_retriever.retrieve_relevant_docs(request.question, k=6)
+        else:
+            retriever = vector_store.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": 6, "fetch_k": 12}
+            )
+            docs = retriever.get_relevant_documents(request.question)
         
-        # Retrieve relevant documents
-        docs = retriever.get_relevant_documents(request.question)
-        
-        # Format response
         retrieved_chunks = []
         for i, doc in enumerate(docs):
             retrieved_chunks.append({
@@ -277,228 +491,180 @@ async def debug_search(request: DebugRequest):
                 "full_length": len(doc.page_content)
             })
         
+        # Add decision engine analysis
+        has_cob = decision_engine.detect_coordination_of_benefits(
+            " ".join([doc.page_content for doc in docs]), 
+            request.question
+        )
+        
         return {
             "question": request.question,
             "total_chunks_retrieved": len(docs),
-            "chunks": retrieved_chunks
+            "chunks": retrieved_chunks,
+            "decision_engine_analysis": {
+                "coordination_of_benefits_detected": has_cob,
+                "retrieval_method": "hybrid" if hybrid_retriever else "vector_only"
+            }
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Debug search error: {str(e)}")
 
-@app.get("/vector-stats")
-async def vector_stats():
-    """Get statistics about the vector store."""
-    global vector_store
+@app.post("/hackrx/run", response_model=EnhancedAnswerResponse)
+async def run_enhanced_query(request: ClaimRequest, token: str = Depends(verify_token)):
+    global vector_store, hybrid_retriever, processed_documents
     
-    if vector_store is None:
-        raise HTTPException(status_code=400, detail="No vector store available")
+    if embeddings is None or llm is None:
+        raise HTTPException(status_code=500, detail="Core components not initialized")
     
-    try:
-        # Get basic stats
-        total_vectors = vector_store.index.ntotal
-        
-        return {
-            "total_vectors": total_vectors,
-            "vector_dimension": vector_store.index.d if hasattr(vector_store.index, 'd') else "unknown",
-            "index_type": str(type(vector_store.index)),
-            "status": "ready"
-        }
-        
-    except Exception as e:
-        return {"error": str(e), "status": "error"}
-    
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    import sys
-    print("\n" + "="*50, file=sys.stderr, flush=True)
-    print("🔍 TOKEN VERIFICATION CALLED", file=sys.stderr, flush=True)
-    print("="*50, file=sys.stderr, flush=True)
-    
-    received_token = credentials.credentials
-    expected_token = os.getenv("AUTH_TOKEN")
-    
-    print(f"🔍 RECEIVED TOKEN: '{received_token}'", file=sys.stderr, flush=True)
-    print(f"🔍 EXPECTED TOKEN: '{expected_token}'", file=sys.stderr, flush=True)
-    print(f"🔍 LENGTHS - Received: {len(received_token)}, Expected: {len(expected_token) if expected_token else 0}", file=sys.stderr, flush=True)
-    
-    if not expected_token:
-        print("❌ AUTH_TOKEN not set in environment", file=sys.stderr, flush=True)
-        raise HTTPException(
-            status_code=500, 
-            detail="Server configuration error: AUTH_TOKEN not set."
-        )
-
-    # Try exact match first
-    if received_token == expected_token:
-        print("✅ EXACT TOKEN MATCH", file=sys.stderr, flush=True)
-        return received_token
-    
-    # Try stripped match
-    if received_token.strip() == expected_token.strip():
-        print("✅ TOKEN MATCH AFTER STRIP", file=sys.stderr, flush=True)
-        return received_token
-    
-    # If no match, show detailed comparison
-    print("❌ TOKEN MISMATCH DETAILS:", file=sys.stderr, flush=True)
-    print(f"  Received bytes: {received_token.encode()}", file=sys.stderr, flush=True)
-    print(f"  Expected bytes: {expected_token.encode()}", file=sys.stderr, flush=True)
-    
-    raise HTTPException(
-        status_code=403, 
-        detail="Invalid or expired token."
-    )
-
-@app.get("/debug-token")
-async def debug_token():
-    """Debug endpoint to check token configuration."""
-    expected_token = os.getenv("AUTH_TOKEN")
-    return {
-        "auth_token_set": expected_token is not None,
-        "auth_token_length": len(expected_token) if expected_token else 0,
-        "auth_token_first_10": expected_token[:10] if expected_token else None,
-        "auth_token_last_10": expected_token[-10:] if expected_token else None,
-        "full_token": expected_token  # Temporary for debugging
-    }
-
-@app.get("/test-auth")
-async def test_auth(token: str = Depends(verify_token)):
-    """Test endpoint to verify authentication is working."""
-    return {"message": "Authentication successful!", "token_received": token[:10] + "..."}
-
-@app.post("/hackrx/run", response_model=AnswerResponse)
-async def run_query(request: QueryRequest, token: str = Depends(verify_token)):
-    global vector_store
-    
-    # Check if required components are available
-    if embeddings is None:
-        raise HTTPException(status_code=500, detail="Embeddings not initialized")
-    if llm is None:
-        raise HTTPException(status_code=500, detail="LLM not initialized")
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+    audit_trail = [f"Request {request_id} started at {datetime.now().isoformat()}"]
     
     try:
-        start = time.time()
-        
-        # Step 1: Process documents (handles both text and URLs)
+        # Step 1: Process documents
         document_content = process_documents(request.documents)
+        audit_trail.append("Documents processed successfully")
         
         if document_content.strip():
-            # Create documents
             docs = [Document(page_content=document_content)]
-            
-            # Split documents into chunks
             chunks = text_splitter.split_documents(docs)
             print(f"Created {len(chunks)} chunks from documents")
+            audit_trail.append(f"Created {len(chunks)} document chunks")
             
             # Create or update vector store
             if vector_store is None:
                 print("Creating new vector store...")
                 vector_store = FAISS.from_documents(chunks, embeddings)
+                processed_documents = chunks
                 print("✅ Vector store created successfully")
+                audit_trail.append("New vector store created")
             else:
-                # Add new documents to existing vector store
                 print("Adding documents to existing vector store...")
                 vector_store.add_documents(chunks)
-                print("✅ Documents added to vector store")
+                processed_documents.extend(chunks)
+                audit_trail.append("Documents added to existing vector store")
+            
+            # Initialize hybrid retriever
+            hybrid_retriever = HybridRetriever(vector_store, processed_documents)
+            audit_trail.append("Hybrid retriever initialized")
         
-        # Step 2: Answer questions
-        answers = []
+        # Step 2: Process each question with enhanced decision logic
+        decisions = []
         
         if vector_store is None:
             for question in request.questions:
-                answers.append("No documents available for search")
+                decisions.append(ClaimDecision(
+                    question=question,
+                    decision="PENDING_REVIEW",
+                    confidence_score=0.0,
+                    reasoning="No documents available for analysis",
+                    processing_notes=["No vector store available"]
+                ))
         else:
-            # Create retrieval QA chain with custom prompt and improved retrieval
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever=vector_store.as_retriever(
-                    search_type="similarity",
-                    search_kwargs={
-                        "k": 6,  # Retrieve more chunks for better coverage
-                        "fetch_k": 12  # Fetch more candidates before filtering
-                    }
-                ),
-                return_source_documents=False,
-                chain_type_kwargs={"prompt": PROMPT}
-            )
-            
             for question in request.questions:
                 try:
                     print(f"Processing question: {question}")
+                    audit_trail.append(f"Processing question: {question[:50]}...")
                     
-                    # Try multiple search variations for better retrieval
-                    search_variations = [
-                        question,
-                        f"coordination of benefits {question}",
-                        f"multiple insurance claims {question}",
-                        "secondary insurance claim remaining amount",
-                        "other insurance coordination benefits"
-                    ]
-                    
-                    all_docs = []
-                    for variation in search_variations:
-                        retriever_temp = vector_store.as_retriever(
-                            search_type="similarity",
-                            search_kwargs={"k": 3, "fetch_k": 6}
-                        )
-                        docs_temp = retriever_temp.get_relevant_documents(variation)
-                        all_docs.extend(docs_temp)
-                    
-                    # Remove duplicates and get unique documents
-                    unique_docs = []
-                    seen_content = set()
-                    for doc in all_docs:
-                        if doc.page_content not in seen_content:
-                            unique_docs.append(doc)
-                            seen_content.add(doc.page_content)
-                    
-                    # Limit to top 6 unique documents
-                    unique_docs = unique_docs[:6]
-                    
-                    print(f"Found {len(unique_docs)} unique relevant chunks")
-                    
-                    # Create a custom retriever that returns our enhanced results
-                    if unique_docs:
-                        # Manually create the context from retrieved docs
-                        context = "\n\n".join([doc.page_content for doc in unique_docs])
-                        
-                        # Use the LLM directly with our custom prompt
-                        formatted_prompt = PROMPT.format(context=context, question=question)
-                        
-                        llm_result = llm.invoke(formatted_prompt)
-                        answer = llm_result.content if hasattr(llm_result, 'content') else str(llm_result)
-                        answers.append(answer.strip())
-                        print(f"✅ Answer generated for: {question}")
+                    # Enhanced retrieval with multiple strategies
+                    if hybrid_retriever:
+                        relevant_docs = hybrid_retriever.retrieve_relevant_docs(question, k=8)
                     else:
-                        # Fallback to original method
-                        result = qa_chain.invoke({"query": question})
-                        answer = result.get("result", "No answer found")
-                        answers.append(answer.strip())
-                        print(f"✅ Fallback answer generated for: {question}")
+                        retriever = vector_store.as_retriever(
+                            search_type="similarity",
+                            search_kwargs={"k": 8, "fetch_k": 16}
+                        )
+                        relevant_docs = retriever.get_relevant_documents(question)
+                    
+                    if relevant_docs:
+                        context = "\n\n".join([doc.page_content for doc in relevant_docs])
+                        
+                        # Generate enhanced prompt with decision structure
+                        formatted_prompt = ENHANCED_PROMPT.format(context=context, question=question)
+                        
+                        # Get LLM response
+                        llm_result = llm.invoke(formatted_prompt)
+                        response_text = llm_result.content if hasattr(llm_result, 'content') else str(llm_result)
+                        
+                        # Parse structured response
+                        parsed_response = parse_llm_response(response_text)
+                        
+                        # Create decision object with enhanced data
+                        decision = ClaimDecision(
+                            question=question,
+                            decision=parsed_response.get("decision", "PENDING_REVIEW"),
+                            confidence_score=parsed_response.get("confidence_score", 0.5),
+                            payout_amount=parsed_response.get("payout_amount"),
+                            reasoning=parsed_response.get("reasoning", "Analysis completed"),
+                            policy_sections_referenced=parsed_response.get("policy_sections_referenced", []),
+                            exclusions_applied=parsed_response.get("exclusions_applied", []),
+                            processing_notes=parsed_response.get("processing_notes", [])
+                        )
+                        
+                        # Add coordination of benefits if detected
+                        cob_data = parsed_response.get("coordination_of_benefits", {})
+                        if cob_data and cob_data.get("has_other_insurance"):
+                            decision.coordination_of_benefits = CoordinationOfBenefits(**cob_data)
+                        
+                        decisions.append(decision)
+                        audit_trail.append(f"Decision generated: {decision.decision} (confidence: {decision.confidence_score})")
+                    else:
+                        decisions.append(ClaimDecision(
+                            question=question,
+                            decision="PENDING_REVIEW",
+                            confidence_score=0.1,
+                            reasoning="No relevant policy information found for this question",
+                            processing_notes=["No relevant documents retrieved"]
+                        ))
+                        audit_trail.append("No relevant documents found")
                         
                 except Exception as e:
-                    print(f"❌ Error answering question '{question}': {str(e)}")
-                    answers.append(f"Error processing question: {str(e)}")
+                    print(f"❌ Error processing question '{question}': {str(e)}")
+                    decisions.append(ClaimDecision(
+                        question=question,
+                        decision="PENDING_REVIEW",
+                        confidence_score=0.0,
+                        reasoning=f"Error during processing: {str(e)}",
+                        processing_notes=[f"Processing error: {str(e)}"]
+                    ))
+                    audit_trail.append(f"Error processing question: {str(e)}")
         
-        processing_time = time.time() - start
-        print(f"RAG processing completed in {processing_time:.2f} seconds")
+        processing_time = time.time() - start_time
+        audit_trail.append(f"Processing completed in {processing_time:.2f} seconds")
         
-        return AnswerResponse(answers=answers)
+        # Create processing metadata
+        metadata = ProcessingMetadata(
+            request_id=request_id,
+            processing_time=processing_time,
+            chunks_analyzed=len(processed_documents) if processed_documents else 0,
+            model_used="llama-3.3-70b-versatile",
+            timestamp=datetime.now().isoformat()
+        )
+        
+        return EnhancedAnswerResponse(
+            decisions=decisions,
+            processing_metadata=metadata,
+            audit_trail=audit_trail
+        )
         
     except Exception as e:
-        print(f"❌ Error in RAG processing: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"RAG Error: {str(e)}")
+        print(f"❌ Error in enhanced RAG processing: {str(e)}")
+        audit_trail.append(f"Fatal error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Enhanced RAG Error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Starting RAG Backend Server...")
+    print("🚀 Starting Enhanced HackRx 6.0 RAG Backend Server...")
     print("📍 Server will be available at:")
     print("   - http://localhost:5000")
-    print("   - http://127.0.0.1:5000")
-    print("📊 Endpoints:")
-    print("   - GET  /            - Root endpoint")
-    print("   - GET  /health      - Health check")
-    print("   - GET  /rag-status  - RAG status")
-    print("   - POST /hackrx/run  - Run RAG query")
+    print("   - http://127.0.0.1:5000") 
+    print("🎯 HackRx 6.0 Features:")
+    print("   - Insurance claim decision engine")
+    print("   - Coordination of benefits analysis")
+    print("   - Structured JSON responses with confidence scores")
+    print("   - Hybrid retrieval (Vector + BM25)")
+    print("   - Audit trail and processing metadata")
+    print("   - Policy section referencing")
     
     uvicorn.run(app, host=HOST, port=PORT)
