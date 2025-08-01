@@ -173,7 +173,7 @@ POLICY CONTEXT:
 QUESTION: {question}
 
 INSTRUCTIONS:
-- Provide a comprehensive answer based on the policy information
+- Provide a comprehensive answer based on the policy informatio
 - Include specific policy section numbers when referencing rules
 - Quote exact amounts, percentages, and conditions
 - If multiple policies are involved, explain the coordination process
