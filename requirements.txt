@@ -11,3 +11,5 @@ pypdf
 faiss-cpu
 typing-extensions
 langchain-mistralai
+langchain-retrievers
+rank_bm25
