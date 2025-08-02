@@ -12,3 +12,4 @@ faiss-cpu
 typing-extensions
 langchain-mistralai
 rank-bm25
+pandas
