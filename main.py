@@ -2304,4 +2304,4 @@ if __name__ == "__main__":
     print("   - Model usage tracking")
     print("   - Success/failure analysis")
     
-    uvicorn.run(app, port=PORT)
+    uvicorn.run(app,host=0.0.0.0, port=PORT)
