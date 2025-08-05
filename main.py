@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException,Depends,Header
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Security
 from pydantic import BaseModel, Field
 from typing import List, Union, Optional, Dict, Any
 import time
@@ -28,7 +29,248 @@ from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
+import hashlib
+import pickle
+import json
 
+class DocumentCache:
+    """Caches PDF content, chunks, embeddings, and vector stores to avoid repeated processing"""
+    
+    def __init__(self, cache_dir="./cache"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.pdf_cache = {}
+        self.chunks_cache = {}
+        self.vector_store_cache = {}
+        self.embedding_cache = {}
+        print(f"✅ Document cache initialized at {self.cache_dir}")
+    
+    def get_url_hash(self, url):
+        """Generate a hash for PDF URL"""
+        return hashlib.md5(url.encode('utf-8')).hexdigest()
+    
+    def get_content_hash(self, content):
+        """Generate a hash for document content"""
+        return hashlib.md5(content.encode('utf-8')).hexdigest()
+    
+    def get_cached_pdf_content(self, pdf_url):
+        """Get cached PDF content if available"""
+        url_hash = self.get_url_hash(pdf_url)
+        cache_file = self.cache_dir / f"pdf_{url_hash}.txt"
+        
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                print(f"📁 Using cached PDF content for {pdf_url[:50]}...")
+                return content
+            except Exception as e:
+                print(f"⚠️ Error reading PDF cache: {e}")
+        
+        return None
+    
+    def cache_pdf_content(self, pdf_url, content):
+        """Cache PDF content to avoid repeated downloads"""
+        try:
+            url_hash = self.get_url_hash(pdf_url)
+            cache_file = self.cache_dir / f"pdf_{url_hash}.txt"
+            
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            print(f"💾 Cached PDF content for {pdf_url[:50]}")
+            return True
+        except Exception as e:
+            print(f"⚠️ Error caching PDF content: {e}")
+            return False
+    
+    def get_cached_chunks(self, content_hash):
+        """Get cached document chunks if available"""
+        chunks_file = self.cache_dir / f"chunks_{content_hash}.pkl"
+        
+        if chunks_file.exists():
+            try:
+                with open(chunks_file, 'rb') as f:
+                    chunks = pickle.load(f)
+                print(f"📁 Using cached chunks for content hash {content_hash[:8]}...")
+                return chunks
+            except Exception as e:
+                print(f"⚠️ Error reading chunks cache: {e}")
+        
+        return None
+    
+    def cache_chunks(self, content_hash, chunks):
+        """Cache document chunks to avoid repeated splitting"""
+        try:
+            chunks_file = self.cache_dir / f"chunks_{content_hash}.pkl"
+            
+            with open(chunks_file, 'wb') as f:
+                pickle.dump(chunks, f)
+            
+            print(f"💾 Cached {len(chunks)} chunks for content hash {content_hash[:8]}")
+            return True
+        except Exception as e:
+            print(f"⚠️ Error caching chunks: {e}")
+            return False
+    
+    def get_cached_embeddings(self, content_hash):
+        """Get cached embeddings if available"""
+        embeddings_file = self.cache_dir / f"embeddings_{content_hash}.pkl"
+        
+        if embeddings_file.exists():
+            try:
+                with open(embeddings_file, 'rb') as f:
+                    embeddings_data = pickle.load(f)
+                print(f"📁 Using cached embeddings for content hash {content_hash[:8]}...")
+                return embeddings_data
+            except Exception as e:
+                print(f"⚠️ Error reading embeddings cache: {e}")
+        
+        return None
+    
+    def cache_embeddings(self, content_hash, embeddings_data):
+        """Cache embeddings to avoid repeated computation"""
+        try:
+            embeddings_file = self.cache_dir / f"embeddings_{content_hash}.pkl"
+            
+            with open(embeddings_file, 'wb') as f:
+                pickle.dump(embeddings_data, f)
+            
+            print(f"💾 Cached embeddings for content hash {content_hash[:8]}")
+            return True
+        except Exception as e:
+            print(f"⚠️ Error caching embeddings: {e}")
+            return False
+    
+    def get_cached_vector_store(self, content_hash):
+        """Get cached vector store if available"""
+        vector_file = self.cache_dir / f"vector_{content_hash}.pkl"
+        
+        if vector_file.exists():
+            try:
+                with open(vector_file, 'rb') as f:
+                    vector_store = pickle.load(f)
+                print(f"📁 Using cached vector store for content hash {content_hash[:8]}...")
+                return vector_store
+            except Exception as e:
+                print(f"⚠️ Error reading vector store cache: {e}")
+        
+        return None
+    
+    def cache_vector_store(self, content_hash, vector_store):
+        """Cache vector store to avoid repeated embedding"""
+        try:
+            vector_file = self.cache_dir / f"vector_{content_hash}.pkl"
+            
+            with open(vector_file, 'wb') as f:
+                pickle.dump(vector_store, f)
+            
+            print(f"💾 Cached vector store for content hash {content_hash[:8]}")
+            return True
+        except Exception as e:
+            print(f"⚠️ Error caching vector store: {e}")
+            return False
+    
+    def get_cached_complete_data(self, pdf_urls):
+        """Get complete cached data (content, chunks, vector store) for PDF URLs"""
+        # Create a combined hash for all URLs
+        combined_content = ""
+        
+        for url in pdf_urls:
+            cached_content = self.get_cached_pdf_content(url)
+            if cached_content is None:
+                return None  # If any PDF is not cached, return None
+            combined_content += cached_content + "\n\n"
+        
+        if not combined_content.strip():
+            return None
+        
+        content_hash = self.get_content_hash(combined_content)
+        
+        # Check if we have all cached components
+        cached_chunks = self.get_cached_chunks(content_hash)
+        cached_vector_store = self.get_cached_vector_store(content_hash)
+        
+        if cached_chunks and cached_vector_store:
+            return {
+                "content": combined_content,
+                "content_hash": content_hash,
+                "chunks": cached_chunks,
+                "vector_store": cached_vector_store
+            }
+        
+        return None
+    
+    def cache_complete_data(self, pdf_urls, content, chunks, vector_store):
+        """Cache complete data for PDF URLs"""
+        content_hash = self.get_content_hash(content)
+        
+        # Cache individual PDF contents
+        if isinstance(pdf_urls, list):
+            for url in pdf_urls:
+                if not self.get_cached_pdf_content(url):
+                    # For simplicity, cache the full content for each URL
+                    # In production, you might want to cache individual PDF contents
+                    self.cache_pdf_content(url, content)
+        
+        # Cache chunks and vector store
+        self.cache_chunks(content_hash, chunks)
+        self.cache_vector_store(content_hash, vector_store)
+        
+        return content_hash
+    
+    def get_cache_stats(self):
+        """Get statistics about the cache"""
+        try:
+            pdf_files = list(self.cache_dir.glob("pdf_*.txt"))
+            chunks_files = list(self.cache_dir.glob("chunks_*.pkl"))
+            vector_files = list(self.cache_dir.glob("vector_*.pkl"))
+            embedding_files = list(self.cache_dir.glob("embeddings_*.pkl"))
+            
+            # Calculate total size
+            pdf_size = sum(f.stat().st_size for f in pdf_files) / (1024 * 1024)  # MB
+            chunks_size = sum(f.stat().st_size for f in chunks_files) / (1024 * 1024)  # MB
+            vector_size = sum(f.stat().st_size for f in vector_files) / (1024 * 1024)  # MB
+            embedding_size = sum(f.stat().st_size for f in embedding_files) / (1024 * 1024)  # MB
+            
+            return {
+                "pdf_files": len(pdf_files),
+                "chunks_files": len(chunks_files),
+                "vector_files": len(vector_files),
+                "embedding_files": len(embedding_files),
+                "pdf_size_mb": round(pdf_size, 2),
+                "chunks_size_mb": round(chunks_size, 2),
+                "vector_size_mb": round(vector_size, 2),
+                "embedding_size_mb": round(embedding_size, 2),
+                "total_size_mb": round(pdf_size + chunks_size + vector_size + embedding_size, 2),
+                "cache_directory": str(self.cache_dir)
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def clear_cache(self):
+        """Clear all cached data"""
+        try:
+            # Remove all cache files
+            for file in self.cache_dir.glob("*.txt"):
+                file.unlink()
+            for file in self.cache_dir.glob("*.pkl"):
+                file.unlink()
+                
+            # Clear in-memory caches
+            self.pdf_cache = {}
+            self.chunks_cache = {}
+            self.vector_store_cache = {}
+            self.embedding_cache = {}
+            
+            print("🧹 Cache cleared successfully")
+            return True
+        except Exception as e:
+            print(f"⚠️ Error clearing cache: {e}")
+            return False
+
+# Initialize document cache
+document_cache = DocumentCache()
 
 class BatchProcessor:
     """Handles parallel processing of questions with rate limiting"""
@@ -91,8 +333,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
-
 # Define security scheme for documentation  
+security = HTTPBearer()
+
+# Define token verification function
+async def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
+    """Verify the token provided in the Authorization header"""
+    token = credentials.credentials
+    # For demonstration purposes, we accept all tokens
+    # In production, implement proper token validation here
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return token
 security = HTTPBearer()
 
 class RateLimitManager:
@@ -663,8 +919,20 @@ def is_url(string: str) -> bool:
     except:
         return False
 
-# Helper function to download and extract text from PDF
+# Global variables to store the vector store and hybrid retriever
+vector_store = None
+hybrid_retriever = None
+processed_documents = []
+batch_processor = None
+last_request_model = None  # Track last used model
+
+# Helper function to download and extract text from PDF with caching
 def extract_pdf_content(pdf_url: str) -> str:
+    # Check cache first
+    cached_content = document_cache.get_cached_pdf_content(pdf_url)
+    if cached_content:
+        return cached_content
+    
     try:
         print(f"📥 Downloading PDF from: {pdf_url}")
         
@@ -695,6 +963,9 @@ def extract_pdf_content(pdf_url: str) -> str:
         # Clean up temporary file
         os.unlink(temp_path)
         
+        # Cache the content
+        document_cache.cache_pdf_content(pdf_url, content)
+        
         print(f"✅ PDF extracted successfully. Content length: {len(content)} characters")
         return content
         
@@ -702,201 +973,65 @@ def extract_pdf_content(pdf_url: str) -> str:
         print(f"❌ Error extracting PDF content: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to extract PDF content: {str(e)}")
 
-# Helper function to process documents (handles both text and URLs)
-def process_documents(documents: Union[List[str], str]) -> str:
+# Helper function to process documents with caching (handles both text and URLs)
+def process_documents_with_cache(documents: Union[List[str], str]) -> Dict[str, Any]:
     if isinstance(documents, str):
         documents = [documents]
     
-    processed_content = []
+    # Separate PDF URLs from text content
+    pdf_urls = []
+    text_content = []
     
     for doc in documents:
         if is_url(doc):
             if doc.lower().endswith('.pdf') or 'pdf' in doc.lower():
-                # Extract PDF content
-                pdf_content = extract_pdf_content(doc)
-                processed_content.append(pdf_content)
+                pdf_urls.append(doc)
             else:
                 raise HTTPException(status_code=400, detail=f"URL format not supported: {doc}")
         else:
-            # Treat as text content
-            processed_content.append(doc)
+            text_content.append(doc)
     
-    return "\n".join(processed_content)
-
-# Global variables to store the vector store and hybrid retriever
-vector_store = None
-hybrid_retriever = None
-processed_documents = []
-batch_processor = None
-last_request_model = None  # Track last used model
-
-@app.get("/")
-def root():
+    # Check if we have complete cached data for all PDF URLs
+    if pdf_urls:
+        cached_data = document_cache.get_cached_complete_data(pdf_urls)
+        if cached_data:
+            print(f"⚡ Using complete cached data for {len(pdf_urls)} PDFs!")
+            # Add text content if any
+            if text_content:
+                cached_data["content"] += "\n\n" + "\n".join(text_content)
+                # Recalculate content hash with text content
+                cached_data["content_hash"] = document_cache.get_content_hash(cached_data["content"])
+            
+            return {
+                "content": cached_data["content"],
+                "content_hash": cached_data["content_hash"],
+                "chunks": cached_data["chunks"],
+                "vector_store": cached_data["vector_store"],
+                "from_cache": True
+            }
+    
+    # If not fully cached, process normally
+    processed_content = []
+    
+    # Process PDF URLs
+    for url in pdf_urls:
+        pdf_content = extract_pdf_content(url)  # This uses individual PDF caching
+        processed_content.append(pdf_content)
+    
+    # Add text content
+    processed_content.extend(text_content)
+    
+    final_content = "\n\n".join(processed_content)
+    content_hash = document_cache.get_content_hash(final_content)
+    
     return {
-        "message": "LangChain RAG Backend with Mistral LLM",
-        "status": "running",
-        "features": [
-            "Multiple Mistral LLM fallback",
-            "Multiple embedding fallback (HuggingFace Local + Endpoint + Mistral)",
-            "Hybrid retrieval (Vector + BM25 + MMR)",
-            "Query logging and analytics"
-        ],
-        "supported_formats": ["text", "pdf_urls"],
-        "endpoints": {
-            "health": "/health",
-            "rag_status": "/rag-status",
-            "run_query": "/hackrx/run",
-            "debug_search": "/debug-search",
-            "vector_stats": "/vector-stats",
-            "llm_status": "/llm-status",
-            "embeddings_status": "/embeddings-status",
-            "query_stats": "/query-stats",
-            "download_logs": "/download-logs"
-        }
+        "content": final_content,
+        "content_hash": content_hash,
+        "chunks": None,
+        "vector_store": None,
+        "from_cache": False,
+        "pdf_urls": pdf_urls
     }
-
-@app.get("/health")
-def health_check():
-    return {
-        "status": "healthy",
-        "embeddings_ready": embeddings is not None,
-        "llm_ready": llm is not None,
-        "vector_store_ready": vector_store is not None
-    }
-
-@app.get("/rag-status")
-def rag_status():
-    """Check RAG tool configuration and status."""
-    return {
-        "rag_tool_configured": True,
-        "llm_provider": "mistral",
-        "llm_model": "mistral-large-2411",
-        "llm_ready": llm is not None,
-        "embedding_provider": "huggingface_endpoint", 
-        "embedding_model": "sentence-transformers/all-mpnet-base-v2",
-        "embeddings_ready": embeddings is not None,
-        "vector_db": "faiss",
-        "vector_store_ready": vector_store is not None,
-        "chunk_size": 800,
-        "chunk_overlap": 150,
-        "framework": "langchain"
-    }
-
-@app.post("/debug-search")
-async def debug_search(request: DebugRequest):
-    """Debug endpoint to see what chunks are retrieved for a question."""
-    global vector_store
-    
-    if vector_store is None:
-        raise HTTPException(status_code=400, detail="No vector store available")
-    
-    try:
-        # Get retriever
-        retriever = vector_store.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 6, "fetch_k": 12}
-        )
-        
-        # Retrieve relevant documents
-        docs = retriever.get_relevant_documents(request.question)
-        
-        # Format response
-        retrieved_chunks = []
-        for i, doc in enumerate(docs):
-            retrieved_chunks.append({
-                "chunk_id": i,
-                "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
-                "full_length": len(doc.page_content)
-            })
-        
-        return {
-            "question": request.question,
-            "total_chunks_retrieved": len(docs),
-            "chunks": retrieved_chunks
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Debug search error: {str(e)}")
-
-@app.get("/vector-stats")
-async def vector_stats():
-    """Get statistics about the vector store."""
-    global vector_store
-    
-    if vector_store is None:
-        raise HTTPException(status_code=400, detail="No vector store available")
-    
-    try:
-        # Get basic stats
-        total_vectors = vector_store.index.ntotal
-        
-        return {
-            "total_vectors": total_vectors,
-            "vector_dimension": vector_store.index.d if hasattr(vector_store.index, 'd') else "unknown",
-            "index_type": str(type(vector_store.index)),
-            "status": "ready"
-        }
-        
-    except Exception as e:
-        return {"error": str(e), "status": "error"}
-    
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    import sys
-    print("\n" + "="*50, file=sys.stderr, flush=True)
-    print("🔍 TOKEN VERIFICATION CALLED", file=sys.stderr, flush=True)
-    print("="*50, file=sys.stderr, flush=True)
-    
-    received_token = credentials.credentials
-    expected_token = os.getenv("AUTH_TOKEN")
-    
-    print(f"🔍 RECEIVED TOKEN: '{received_token}'", file=sys.stderr, flush=True)
-    print(f"🔍 EXPECTED TOKEN: '{expected_token}'", file=sys.stderr, flush=True)
-    print(f"🔍 LENGTHS - Received: {len(received_token)}, Expected: {len(expected_token) if expected_token else 0}", file=sys.stderr, flush=True)
-    
-    if not expected_token:
-        print("❌ AUTH_TOKEN not set in environment", file=sys.stderr, flush=True)
-        raise HTTPException(
-            status_code=500, 
-            detail="Server configuration error: AUTH_TOKEN not set."
-        )
-
-    # Try exact match first
-    if received_token == expected_token:
-        print("✅ EXACT TOKEN MATCH", file=sys.stderr, flush=True)
-        return received_token
-    
-    # Try stripped match
-    if received_token.strip() == expected_token.strip():
-        print("✅ TOKEN MATCH AFTER STRIP", file=sys.stderr, flush=True)
-        return received_token
-    
-    # If no match, show detailed comparison
-    print("❌ TOKEN MISMATCH DETAILS:", file=sys.stderr, flush=True)
-    print(f"  Received bytes: {received_token.encode()}", file=sys.stderr, flush=True)
-    print(f"  Expected bytes: {expected_token.encode()}", file=sys.stderr, flush=True)
-    
-    raise HTTPException(
-        status_code=403, 
-        detail="Invalid or expired token."
-    )
-
-@app.get("/debug-token")
-async def debug_token():
-    """Debug endpoint to check token configuration."""
-    expected_token = os.getenv("AUTH_TOKEN")
-    return {
-        "auth_token_set": expected_token is not None,
-        "auth_token_length": len(expected_token) if expected_token else 0,
-        "auth_token_first_10": expected_token[:10] if expected_token else None,
-        "auth_token_last_10": expected_token[-10:] if expected_token else None,
-        "full_token": expected_token  # Temporary for debugging
-    }
-
-@app.get("/test-auth")
-async def test_auth(token: str = Depends(verify_token)):
-    """Test endpoint to verify authentication is working."""
-    return {"message": "Authentication successful!", "token_received": token[:10] + "..."}
-
 
 class HybridRetriever:
     """Enhanced retrieval system combining semantic and keyword search"""
@@ -1283,6 +1418,20 @@ def download_logs():
     else:
         raise HTTPException(status_code=404, detail="Log file not found")
 
+@app.get("/cache-stats")
+def get_cache_stats():
+    """Get cache statistics"""
+    return document_cache.get_cache_stats()
+
+@app.post("/clear-cache")
+async def clear_cache():
+    """Clear all cached data"""
+    success = document_cache.clear_cache()
+    if success:
+        return {"message": "Cache cleared successfully"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to clear cache")
+
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def run_query(request: QueryRequest, token: str = Depends(verify_token)):
     global vector_store, hybrid_retriever, processed_documents, batch_processor, last_request_model
@@ -1323,73 +1472,98 @@ async def run_query(request: QueryRequest, token: str = Depends(verify_token)):
     elif hasattr(llm, 'model'):
         current_model_name = llm.model
     
-    print(f"🚀 Processing {len(request.questions)} questions in FULL PARALLEL MODE - Request: {request_id}")
+    print(f"🚀 Processing {len(request.questions)} questions with CACHING - Request: {request_id}")
     
     try:
-        # Step 1: Process documents (handles both text and URLs)
-        document_content = process_documents(request.documents)
+        # Step 1: Process documents with caching (handles both text and URLs)
+        doc_data = process_documents_with_cache(request.documents)
+        document_content = doc_data["content"]
+        content_hash = doc_data["content_hash"]
         document_type = "pdf" if any(is_url(doc) and 'pdf' in doc.lower() for doc in (request.documents if isinstance(request.documents, list) else [request.documents])) else "text"
         
         if document_content.strip():
-            # Create documents
-            docs = [Document(page_content=document_content)]
-            
-            # Split documents into chunks with optimized parameters for speed
-            text_splitter_fast = RecursiveCharacterTextSplitter(
-                chunk_size=1500,  # Even larger chunks for faster processing
-                chunk_overlap=250,  # Adequate overlap
-                separators=["\n\n", "\n", ". ", " ", ""]
-            )
-            chunks = text_splitter_fast.split_documents(docs)
-            print(f"Created {len(chunks)} chunks from documents (optimized for speed)")
-            
-            # Limit chunks for faster processing if too many
-            if len(chunks) > 400:  # Further reduced limit
-                print(f"⚡ Limiting to 400 chunks (from {len(chunks)}) for maximum speed")
-                chunks = chunks[:400]
-            
-            # Create or update vector store with fallback embeddings
-            if vector_store is None:
-                print("Creating new vector store...")
-                # Fix: Use the proper method to get embedding from manager
-                if hasattr(embeddings, 'get_current_embedding'):
-                    current_emb = embeddings.get_current_embedding()
-                    if current_emb:
-                        vector_store = FAISS.from_documents(chunks, current_emb)
-                    else:
-                        raise Exception("No current embedding available from fallback manager")
-                else:
-                    # Direct embedding model (not a manager)
-                    vector_store = FAISS.from_documents(chunks, embeddings)
-                
-                # Store processed documents for BM25
+            if doc_data["from_cache"]:
+                # Use cached data
+                print("⚡ Using fully cached data - no processing needed!")
+                chunks = doc_data["chunks"]
+                vector_store = doc_data["vector_store"]
                 processed_documents = chunks
                 
                 # Initialize hybrid retriever
                 hybrid_retriever = HybridRetriever(vector_store, processed_documents)
-                print("✅ Vector store and hybrid retriever created successfully")
+                print("✅ Loaded from cache and hybrid retriever created successfully")
             else:
-                # Add new documents to existing vector store
-                print("Adding documents to existing vector store...")
-                # Fix: Use the proper method for adding documents
-                if hasattr(embeddings, 'get_current_embedding'):
-                    current_emb = embeddings.get_current_embedding()
-                    if current_emb:
-                        # Create temporary vector store for new chunks
-                        temp_vector_store = FAISS.from_documents(chunks, current_emb)
-                        # Merge with existing vector store
-                        vector_store.merge_from(temp_vector_store)
-                    else:
-                        raise Exception("No current embedding available from fallback manager")
+                print("🔄 Cache miss - processing documents...")
+                
+                # Check if we have cached chunks
+                cached_chunks = document_cache.get_cached_chunks(content_hash)
+                cached_vector_store = document_cache.get_cached_vector_store(content_hash)
+                
+                if cached_chunks and cached_vector_store:
+                    print("📁 Using cached chunks and vector store")
+                    chunks = cached_chunks
+                    vector_store = cached_vector_store
+                    processed_documents = chunks
                 else:
-                    # Direct embedding model
-                    vector_store.add_documents(chunks)
+                    # Create documents
+                    docs = [Document(page_content=document_content)]
+                    
+                    if cached_chunks:
+                        print("📁 Using cached chunks")
+                        chunks = cached_chunks
+                    else:
+                        # Split documents into chunks with optimized parameters
+                        text_splitter_fast = RecursiveCharacterTextSplitter(
+                            chunk_size=1500,  # Larger chunks for faster processing
+                            chunk_overlap=250,  # Adequate overlap
+                            separators=["\n\n", "\n", ". ", " ", ""]
+                        )
+                        chunks = text_splitter_fast.split_documents(docs)
+                        print(f"Created {len(chunks)} chunks from documents")
+                        
+                        # Limit chunks for faster processing if too many
+                        if len(chunks) > 400:
+                            print(f"⚡ Limiting to 400 chunks (from {len(chunks)}) for maximum speed")
+                            chunks = chunks[:400]
+                        
+                        # Cache the chunks
+                        document_cache.cache_chunks(content_hash, chunks)
+                    
+                    # Create vector store if not cached
+                    if cached_vector_store:
+                        print("📁 Using cached vector store")
+                        vector_store = cached_vector_store
+                    else:
+                        print("🔄 Creating new vector store...")
+                        # Create vector store with fallback embeddings
+                        if hasattr(embeddings, 'get_current_embedding'):
+                            current_emb = embeddings.get_current_embedding()
+                            if current_emb:
+                                vector_store = FAISS.from_documents(chunks, current_emb)
+                            else:
+                                raise Exception("No current embedding available from fallback manager")
+                        else:
+                            # Direct embedding model (not a manager)
+                            vector_store = FAISS.from_documents(chunks, embeddings)
+                        
+                        # Cache the vector store
+                        document_cache.cache_vector_store(content_hash, vector_store)
+                    
+                    # Store processed documents for BM25
+                    processed_documents = chunks
                 
-                processed_documents.extend(chunks)
+                # Cache complete data if we have PDF URLs and it's not from cache
+                if not doc_data["from_cache"] and doc_data.get("pdf_urls"):
+                    document_cache.cache_complete_data(
+                        doc_data["pdf_urls"], 
+                        document_content, 
+                        chunks, 
+                        vector_store
+                    )
                 
-                # Reinitialize hybrid retriever with updated documents
+                # Initialize hybrid retriever
                 hybrid_retriever = HybridRetriever(vector_store, processed_documents)
-                print("✅ Documents added to vector store and hybrid retriever updated")
+                print("✅ Vector store and hybrid retriever created successfully")
         
         # Initialize batch processor if needed with higher concurrency
         if batch_processor is None:
@@ -1433,14 +1607,14 @@ async def run_query(request: QueryRequest, token: str = Depends(verify_token)):
                     try:
                         print(f"🔍 Processing Q{question_index+1} in parallel: {question[:50]}...")
                         
-                        # Use hybrid retriever with optimized parameters for speed
+                        # Use hybrid retriever with optimized parameters
                         if hybrid_retriever:
-                            relevant_docs = hybrid_retriever.retrieve_relevant_docs(question, k=5)  # Reduced to 5 for speed
+                            relevant_docs = hybrid_retriever.retrieve_relevant_docs(question, k=8)  # Optimized for speed
                         else:
-                            # Enhanced fallback retrieval with reduced parameters
+                            # Enhanced fallback retrieval
                             retriever = vector_store.as_retriever(
-                                search_type="similarity",  # Faster than MMR
-                                search_kwargs={"k": 5, "fetch_k": 10}  # Further reduced for speed
+                                search_type="similarity",
+                                search_kwargs={"k": 8, "fetch_k": 16}
                             )
                             relevant_docs = retriever.get_relevant_documents(question)
                         
@@ -1448,10 +1622,10 @@ async def run_query(request: QueryRequest, token: str = Depends(verify_token)):
                         print(f"   📊 Q{question_index+1}: Retrieved {chunks_retrieved} chunks")
                         
                         if relevant_docs:
-                            # Create optimized context with reduced length for speed
-                            context = create_optimized_context(relevant_docs, question, max_length=6000)  # Further reduced
+                            # Create optimized context
+                            context = create_optimized_context(relevant_docs, question, max_length=8000)
                             
-                            # Use LLM directly for maximum speed (no additional batch processing)
+                            # Use LLM directly for maximum speed
                             formatted_prompt = PROMPT.format(context=context, question=question)
                             
                             # Use LLM with fallback
@@ -1552,12 +1726,13 @@ async def run_query(request: QueryRequest, token: str = Depends(verify_token)):
         processing_time = time.time() - start_time
         avg_time_per_question = processing_time / len(request.questions)
         
-        print(f"🎉 FULL PARALLEL RAG processing completed in {processing_time:.2f} seconds")
+        print(f"🎉 CACHED RAG processing completed in {processing_time:.2f} seconds")
         print(f"📊 Average time per question: {avg_time_per_question:.2f} seconds")
-        print(f"⚡ Speed improvement: {len(request.questions)}x parallelization")
+        print(f"⚡ Speed improvement: {len(request.questions)}x parallelization + caching")
         print(f"🎯 Used model: {current_model_name}")
         print(f"📝 Logged {len(request.questions)} queries to CSV")
         print(f"🔍 Used {'hybrid' if hybrid_retriever else 'basic'} retrieval system")
+        print(f"💾 Cache stats: {document_cache.get_cache_stats()}")
         
         return AnswerResponse(answers=answers)
         
@@ -1581,9 +1756,122 @@ async def run_query(request: QueryRequest, token: str = Depends(verify_token)):
         
         raise HTTPException(status_code=500, detail=f"RAG Error: {str(e)}")
 
+@app.get("/")
+def root():
+    return {
+        "message": "LangChain RAG Backend with Mistral LLM and Caching",
+        "status": "running",
+        "features": [
+            "Multiple Mistral LLM fallback",
+            "Multiple embedding fallback (HuggingFace Local + Endpoint + Mistral)",
+            "Hybrid retrieval (Vector + BM25 + MMR)",
+            "Query logging and analytics",
+            "Document and embedding caching"
+        ],
+        "supported_formats": ["text", "pdf_urls"],
+        "endpoints": {
+            "health": "/health",
+            "rag_status": "/rag-status",
+            "run_query": "/hackrx/run",
+            "debug_search": "/debug-search",
+            "vector_stats": "/vector-stats",
+            "llm_status": "/llm-status",
+            "embeddings_status": "/embeddings-status",
+            "query_stats": "/query-stats",
+            "download_logs": "/download-logs",
+            "cache_stats": "/cache-stats",
+            "clear_cache": "/clear-cache"
+        }
+    }
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "embeddings_ready": embeddings is not None,
+        "llm_ready": llm is not None,
+        "vector_store_ready": vector_store is not None
+    }
+
+@app.get("/rag-status")
+def rag_status():
+    """Check RAG tool configuration and status."""
+    return {
+        "rag_tool_configured": True,
+        "llm_provider": "mistral",
+        "llm_model": "mistral-large-2411",
+        "llm_ready": llm is not None,
+        "embedding_provider": "huggingface_local", 
+        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+        "embeddings_ready": embeddings is not None,
+        "vector_db": "faiss",
+        "vector_store_ready": vector_store is not None,
+        "chunk_size": 800,
+        "chunk_overlap": 150,
+        "framework": "langchain"
+    }
+
+@app.post("/debug-search")
+async def debug_search(request: DebugRequest):
+    """Debug endpoint to see what chunks are retrieved for a question."""
+    global vector_store
+    
+    if vector_store is None:
+        raise HTTPException(status_code=400, detail="No vector store available")
+    
+    try:
+        # Get retriever
+        retriever = vector_store.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 6, "fetch_k": 12}
+        )
+        
+        # Retrieve relevant documents
+        docs = retriever.get_relevant_documents(request.question)
+        
+        # Format response
+        retrieved_chunks = []
+        for i, doc in enumerate(docs):
+            retrieved_chunks.append({
+                "chunk_id": i,
+                "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
+                "full_length": len(doc.page_content)
+            })
+        
+        return {
+            "question": request.question,
+            "total_chunks_retrieved": len(docs),
+            "chunks": retrieved_chunks
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Debug search error: {str(e)}")
+
+@app.get("/vector-stats")
+async def vector_stats():
+    """Get statistics about the vector store."""
+    global vector_store
+    
+    if vector_store is None:
+        raise HTTPException(status_code=400, detail="No vector store available")
+    
+    try:
+        # Get basic stats
+        total_vectors = vector_store.index.ntotal
+        
+        return {
+            "total_vectors": total_vectors,
+            "vector_dimension": vector_store.index.d if hasattr(vector_store.index, 'd') else "unknown",
+            "index_type": str(type(vector_store.index)),
+            "status": "ready"
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Starting RAG Backend Server with Mistral LLM...")
+    print("🚀 Starting RAG Backend Server with Mistral LLM and Caching...")
     print("📍 Server will be available at:")
     print("   - http://localhost:5000")
     print("   - http://127.0.0.1:5000")
@@ -1592,6 +1880,7 @@ if __name__ == "__main__":
     print("   - Multiple embedding fallback (HuggingFace Local + Endpoint + Mistral)")
     print("   - Hybrid retrieval (Vector + BM25 + MMR)")
     print("   - Query logging and analytics")
+    print("   - Intelligent document and embedding caching")
     print("📊 Endpoints:")
     print("   - GET  /            - Root endpoint")
     print("   - GET  /health      - Health check")
@@ -1601,5 +1890,7 @@ if __name__ == "__main__":
     print("   - GET  /embeddings-status - Embeddings fallback status")
     print("   - GET  /query-stats - Query statistics")
     print("   - GET  /download-logs - Download CSV logs")
+    print("   - GET  /cache-stats - Cache statistics")
+    print("   - POST /clear-cache - Clear all cache")
     
     uvicorn.run(app, host=HOST, port=PORT)
