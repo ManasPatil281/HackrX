@@ -36,12 +36,3 @@ requests
 
 # Text processing
 beautifulsoup4
-
-# Async support
-asyncio
-
-# Additional utilities
-pathlib
-uuid
-hashlib
-pickle
