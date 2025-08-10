@@ -1,14 +1,47 @@
+# Core FastAPI and web framework dependencies
 fastapi
 uvicorn
+python-multipart
+python-dotenv
+
+# LangChain ecosystem
 langchain
 langchain-community
 langchain-groq
 langchain-huggingface
-pydantic
-requests
-python-dotenv
-pypdf
-faiss-cpu
-typing-extensions
 langchain-mistralai
-rank-bm25
+
+# Vector stores and embeddings
+faiss-cpu
+sentence-transformers
+
+# Document processing
+pypdf
+python-docx
+openpyxl
+python-pptx
+unstructured
+pillow
+
+# OCR libraries
+easyocr
+pytesseract
+
+# Data processing
+pandas
+numpy
+
+# HTTP requests
+requests
+
+# Text processing
+beautifulsoup4
+
+# Async support
+asyncio
+
+# Additional utilities
+pathlib
+uuid
+hashlib
+pickle
