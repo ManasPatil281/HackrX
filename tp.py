@@ -806,7 +806,7 @@ class HybridRetriever:
             try:
                 vector_retriever = self.vector_store.as_retriever(
                     search_type="similarity",
-                    search_kwargs={"k": k//1.5, "fetch_k": k * 3}
+                    search_kwargs={"k": k//2, "fetch_k": k * 3}
                 )
                 vector_docs = vector_retriever.get_relevant_documents(q)
                 all_docs.extend(vector_docs)
@@ -1324,4 +1324,5 @@ if __name__ == "__main__":
     else:
         print("   ⚠️ Office libs not available - install: pip install python-docx openpyxl python-pptx")
     
+
     uvicorn.run(app, host=HOST, port=PORT)
